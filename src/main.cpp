@@ -45,7 +45,7 @@ static const char* DEVICE_MFR   = "Nahu Industries";
 // =====================================================
 static const char* WIFI_SSID = "Fibra Nahuel";
 static const char* WIFI_PASS = "micaela1994";
-
+//Use your own mqtt broker data
 static const char* MQTT_HOST = "192.168.1.40";
 static const uint16_t MQTT_PORT = 1883;
 static const char* MQTT_USER = "mqtt";
