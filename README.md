@@ -5,6 +5,7 @@ ESP32-based presence sensor using a Waveshare 24 GHz mmWave radar module.
 The project is built with PlatformIO and supports both ESP32-S3 Super Mini and ESP32-C3 Super Mini boards. It publishes presence data over MQTT and includes Home Assistant MQTT Discovery support.
 
 > This project was developed with AI assistance. The code was manually reviewed, adapted, and tested for my own use case, but it may still contain bugs, questionable decisions, or small digital demons hiding in the loop.
+> There's a file called usb-uart.cpp that you can load onto your microcontroller and use the WaveShare app for calibrating the sensor. It's highly recommended to bring the delay of lack of presence from 30 seconds to something like 5/10 seconds. 
 
 ## Features
 
@@ -14,6 +15,7 @@ The project is built with PlatformIO and supports both ESP32-S3 Super Mini and E
 - MQTT status publishing
 - Home Assistant MQTT Discovery
 - PlatformIO-based build system
+- 
 
 ## Hardware
 
