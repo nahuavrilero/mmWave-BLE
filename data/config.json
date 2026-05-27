@@ -1,0 +1,15 @@
+{
+  "deviceId": "s1",
+  "uniqueBase": "mmwave_s1",
+  "deviceName": "mmWave S1 - Dormitorio",
+  "wifiSsid": "Fibra Nahuel",
+  "wifiPass": "micaela1994",
+  "haHost": "",
+  "mqttHost": "",
+  "mqttPort": 1883,
+  "mqttUser": "mqtt",
+  "mqttPass": "mqtt",
+  "usbUartMode": false,
+  "ledActiveLow": true,
+  "ledPresenceDuty": 8
+}
