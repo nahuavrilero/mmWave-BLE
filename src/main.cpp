@@ -4,6 +4,7 @@
 #include <LittleFS.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include <WiFi.h>
 
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3
@@ -19,8 +20,8 @@
 #error "MMWAVE_TX_PIN no definido"
 #endif
 
-#ifndef BUILTIN_LED
-#define BUILTIN_LED 8
+#ifndef PRESENCE_LED_PIN
+  #define PRESENCE_LED_PIN 8
 #endif
 
 // =====================================================
@@ -42,11 +43,16 @@ static const char* DEVICE_MFR   = "Nahu Industries";
 static const char* MQTT_ROOT = "mmwave";
 static const char* HA_DISCOVERY_ROOT = "homeassistant";
 static const char* CONFIG_PATH = "/config.json";
+static const char* INDEX_PATH = "/index.html";
 
+static const uint8_t LED_PWM_CHANNEL = 0;
+static const uint32_t LED_PWM_FREQ = 5000;
+static const uint8_t LED_PWM_RESOLUTION = 8;
+
+static const char* DEFAULT_HA_HOST = "192.168.1.51";
 static const char* HA_HOST_CANDIDATES[] = {
   "homeassistant.local",
-  "192.168.1.40",
-  "192.168.1.48"
+  DEFAULT_HA_HOST
 };
 
 struct AppConfig {
@@ -61,7 +67,8 @@ struct AppConfig {
   String mqttUser = "mqtt";
   String mqttPass = "mqtt";
   bool usbUartMode = false;
-  bool ledActiveLow = true;
+  bool ledActiveLow = false;
+  bool ledUsePwm = false;
   uint8_t ledPresenceDuty = 8;
 };
 
@@ -94,6 +101,8 @@ static const uint32_t POLL_MS = 50;
 static const uint32_t HEARTBEAT_MS = 30000;
 static const uint32_t PRESENCE_OFF_HOLD_MS = 1000;
 static const uint32_t MIN_AWAKE_AFTER_CHANGE_MS = 1200;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 35000;
+static const uint32_t WIFI_AP_RETRY_MS = 60000;
 
 // =====================================================
 // ESTADO
@@ -101,11 +110,20 @@ static const uint32_t MIN_AWAKE_AFTER_CHANGE_MS = 1200;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 WebServer webServer(80);
+WebSocketsServer webSocket(81);
 
 bool rawPresence = false;
 bool presence = false;
 bool lastPublishedRaw = false;
 bool lastPublishedPresence = false;
+bool webAppStarted = false;
+bool configApStarted = false;
+bool presenceLedReady = false;
+bool presenceLedPwmAttached = false;
+bool ledTargetOn = false;
+bool lastLedUsePwm = false;
+bool lastLedActiveLow = false;
+uint8_t lastLedPresenceDuty = 255;
 
 uint32_t lastRawOnMs = 0;
 uint32_t lastRawOffMs = 0;
@@ -113,6 +131,11 @@ uint32_t lastChangeMs = 0;
 uint32_t lastHeartbeatMs = 0;
 uint32_t lastUartPresenceMs = 0;
 uint32_t lastMqttAttemptMs = 0;
+uint32_t lastWifiRetryMs = 0;
+uint32_t ledTestUntilMs = 0;
+uint32_t ledTestNextToggleMs = 0;
+uint32_t ledPreviewUntilMs = 0;
+bool ledTestState = false;
 
 uint16_t targetDistance = 0;
 uint16_t gateEnergy[16] = {0};
@@ -131,6 +154,11 @@ String resolveLocalHost(const String& host);
 String resolvedMqttHost();
 
 void connectWiFi();
+bool isWifiConnected();
+void startConfigAccessPoint();
+void printWifiScanForConfiguredSsid();
+bool findBestConfiguredWifi(uint8_t* bssid, int32_t& channel, int32_t& rssi, wifi_auth_mode_t& authMode);
+void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 void connectMQTT();
 void ensureConnections();
 
@@ -138,6 +166,10 @@ void startWebApp();
 void handleWebRoot();
 void handleWebSave();
 void handleWebConfigJson();
+void webSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload, size_t length);
+void sendWebState(uint8_t clientNum, const char* message = nullptr);
+void broadcastWebState(const char* message = nullptr);
+void applyConfigFromJson(JsonObjectConst doc);
 String htmlEscape(const String& s);
 String checkedAttr(bool value);
 
@@ -148,7 +180,13 @@ bool readOutPresencePin();
 
 void setRawPresence(bool newValue, const char* reason);
 void updatePresenceLogic();
+void setupPresenceLed();
 void setPresenceLed(bool on);
+void tickPresenceLed();
+void tickLedTest();
+void tickLedPreview();
+uint8_t ledPwmValue(bool on);
+void writePresenceLedDigital(bool on);
 void publishState(bool force = false);
 void publishDebug(const char* msg);
 void publishHomeAssistantDiscovery();
@@ -214,6 +252,7 @@ void loadConfig() {
   cfg.mqttPass = doc["mqttPass"] | cfg.mqttPass;
   cfg.usbUartMode = doc["usbUartMode"] | cfg.usbUartMode;
   cfg.ledActiveLow = doc["ledActiveLow"] | cfg.ledActiveLow;
+  cfg.ledUsePwm = doc["ledUsePwm"] | cfg.ledUsePwm;
   cfg.ledPresenceDuty = doc["ledPresenceDuty"] | cfg.ledPresenceDuty;
 }
 
@@ -231,6 +270,7 @@ void saveConfig() {
   doc["mqttPass"] = cfg.mqttPass;
   doc["usbUartMode"] = cfg.usbUartMode;
   doc["ledActiveLow"] = cfg.ledActiveLow;
+  doc["ledUsePwm"] = cfg.ledUsePwm;
   doc["ledPresenceDuty"] = cfg.ledPresenceDuty;
 
   File file = LittleFS.open(CONFIG_PATH, "w");
@@ -268,7 +308,7 @@ void selectHomeAssistantHost() {
     Serial.println("FAIL");
   }
 
-  selectedHaHost = cfg.haHost.length() > 0 ? cfg.haHost : HA_HOST_CANDIDATES[2];
+  selectedHaHost = cfg.haHost.length() > 0 ? cfg.haHost : DEFAULT_HA_HOST;
   Serial.printf("[HA] sin respuesta; fallback=%s\n", selectedHaHost.c_str());
 }
 
@@ -308,7 +348,7 @@ String resolveLocalHost(const String& host) {
 String resolvedMqttHost() {
   if (cfg.mqttHost.length() > 0) return cfg.mqttHost;
   if (selectedHaHost.length() > 0) return selectedHaHost;
-  return HA_HOST_CANDIDATES[2];
+  return DEFAULT_HA_HOST;
 }
 
 // =====================================================
@@ -379,102 +419,48 @@ void startWebApp() {
   webServer.on("/save", HTTP_POST, handleWebSave);
   webServer.on("/config.json", HTTP_GET, handleWebConfigJson);
   webServer.begin();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  webAppStarted = true;
   Serial.print("[WEB] http://");
-  Serial.println(WiFi.localIP());
+  Serial.println(configApStarted ? WiFi.softAPIP() : WiFi.localIP());
+  Serial.println("[WEB] websocket ws://<ip>:81/");
 }
 
 void handleWebRoot() {
-  String page;
-  page.reserve(6200);
-  page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  page += F("<title>mmWave config</title><style>");
-  page += F("body{font-family:system-ui,Segoe UI,sans-serif;margin:0;background:#f5f7f8;color:#15202b}");
-  page += F("main{max-width:760px;margin:0 auto;padding:20px}.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}");
-  page += F("label{display:grid;gap:5px;font-size:13px}input{font:inherit;padding:9px;border:1px solid #b8c3cc;border-radius:6px;background:white}");
-  page += F("section{margin:14px 0;padding:14px 0;border-top:1px solid #d7dee4}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}");
-  page += F("button{font:inherit;padding:10px 14px;border:0;border-radius:6px;background:#1f7a5c;color:white;cursor:pointer}.muted{color:#5a6872;font-size:13px}");
-  page += F("input[type=checkbox]{width:20px;height:20px}.check{display:flex;gap:10px;align-items:center}.check span{font-size:14px}");
-  page += F("</style></head><body><main><h1>mmWave config</h1>");
-  page += F("<p class='muted'>HA: ");
-  page += htmlEscape(selectedHaHost);
-  page += F(" | MQTT: ");
-  page += htmlEscape(selectedMqttHost);
-  page += F(" | IP: ");
-  page += WiFi.localIP().toString();
-  page += F("</p><form method='post' action='/save'>");
-
-  page += F("<section><h2>Identidad</h2><div class='grid'>");
-  page += F("<label>Device ID<input name='deviceId' value='");
-  page += htmlEscape(cfg.deviceId);
-  page += F("'></label>");
-  page += F("<label>Unique base<input name='uniqueBase' value='");
-  page += htmlEscape(cfg.uniqueBase);
-  page += F("'></label>");
-  page += F("<label>Nombre<input name='deviceName' value='");
-  page += htmlEscape(cfg.deviceName);
-  page += F("'></label>");
-  page += F("</div></section>");
-
-  page += F("<section><h2>Red</h2><div class='grid'>");
-  page += F("<label>WiFi SSID<input name='wifiSsid' value='");
-  page += htmlEscape(cfg.wifiSsid);
-  page += F("'></label>");
-  page += F("<label>WiFi pass<input name='wifiPass' type='password' value='");
-  page += htmlEscape(cfg.wifiPass);
-  page += F("'></label>");
-  page += F("<label>HA host<input name='haHost' placeholder='auto' value='");
-  page += htmlEscape(cfg.haHost);
-  page += F("'></label>");
-  page += F("<label>MQTT host<input name='mqttHost' placeholder='usa HA detectado' value='");
-  page += htmlEscape(cfg.mqttHost);
-  page += F("'></label>");
-  page += F("<label>MQTT port<input name='mqttPort' type='number' min='1' max='65535' value='");
-  page += String(cfg.mqttPort);
-  page += F("'></label>");
-  page += F("<label>MQTT user<input name='mqttUser' value='");
-  page += htmlEscape(cfg.mqttUser);
-  page += F("'></label>");
-  page += F("<label>MQTT pass<input name='mqttPass' type='password' value='");
-  page += htmlEscape(cfg.mqttPass);
-  page += F("'></label>");
-  page += F("</div></section>");
-
-  page += F("<section><h2>Modos</h2><div class='grid'>");
-  page += F("<label class='check'><input type='checkbox' name='usbUartMode'");
-  page += checkedAttr(cfg.usbUartMode);
-  page += F("><span>USB &gt; UART</span></label>");
-  page += F("<label class='check'><input type='checkbox' name='ledActiveLow'");
-  page += checkedAttr(cfg.ledActiveLow);
-  page += F("><span>LED onboard activo en LOW</span></label>");
-  page += F("<label>Brillo LED presencia<input name='ledPresenceDuty' type='number' min='0' max='255' value='");
-  page += String(cfg.ledPresenceDuty);
-  page += F("'></label>");
-  page += F("</div></section>");
-
-  page += F("<div class='row'><button type='submit'>Guardar</button><span class='muted'>Algunos cambios aplican mejor reiniciando. Tranqui, no muerde.</span></div>");
-  page += F("</form></main></body></html>");
-  webServer.send(200, "text/html", page);
+  File file = LittleFS.open(INDEX_PATH, "r");
+  if (!file) {
+    webServer.send(500, "text/plain", "index.html no encontrado en LittleFS");
+    return;
+  }
+  webServer.streamFile(file, "text/html");
+  file.close();
 }
 
 void handleWebSave() {
-  cfg.deviceId = webServer.arg("deviceId");
-  cfg.uniqueBase = webServer.arg("uniqueBase");
-  cfg.deviceName = webServer.arg("deviceName");
-  cfg.wifiSsid = webServer.arg("wifiSsid");
-  cfg.wifiPass = webServer.arg("wifiPass");
-  cfg.haHost = webServer.arg("haHost");
-  cfg.mqttHost = webServer.arg("mqttHost");
-  cfg.mqttPort = constrain(webServer.arg("mqttPort").toInt(), 1, 65535);
-  cfg.mqttUser = webServer.arg("mqttUser");
-  cfg.mqttPass = webServer.arg("mqttPass");
-  cfg.usbUartMode = webServer.hasArg("usbUartMode");
-  cfg.ledActiveLow = webServer.hasArg("ledActiveLow");
-  cfg.ledPresenceDuty = constrain(webServer.arg("ledPresenceDuty").toInt(), 0, 255);
+  JsonDocument doc;
+  doc["deviceId"] = webServer.arg("deviceId");
+  doc["uniqueBase"] = webServer.arg("uniqueBase");
+  doc["deviceName"] = webServer.arg("deviceName");
+  doc["wifiSsid"] = webServer.arg("wifiSsid");
+  doc["wifiPass"] = webServer.arg("wifiPass");
+  doc["haHost"] = webServer.arg("haHost");
+  doc["mqttHost"] = webServer.arg("mqttHost");
+  doc["mqttPort"] = constrain(webServer.arg("mqttPort").toInt(), 1, 65535);
+  doc["mqttUser"] = webServer.arg("mqttUser");
+  doc["mqttPass"] = webServer.arg("mqttPass");
+  doc["usbUartMode"] = webServer.hasArg("usbUartMode");
+  doc["ledActiveLow"] = webServer.hasArg("ledActiveLow");
+  doc["ledUsePwm"] = webServer.hasArg("ledUsePwm");
+  doc["ledPresenceDuty"] = constrain(webServer.arg("ledPresenceDuty").toInt(), 0, 255);
+
+  applyConfigFromJson(doc.as<JsonObjectConst>());
 
   saveConfig();
   selectHomeAssistantHost();
   selectedMqttHost = resolvedMqttHost();
   mqttClient.setServer(selectedMqttHost.c_str(), cfg.mqttPort);
+  setupPresenceLed();
   setPresenceLed(presence);
 
   webServer.sendHeader("Location", "/");
@@ -489,6 +475,160 @@ void handleWebConfigJson() {
   }
   webServer.streamFile(file, "application/json");
   file.close();
+}
+
+void webSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    sendWebState(clientNum, "Conectado.");
+    return;
+  }
+
+  if (type != WStype_TEXT) return;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    sendWebState(clientNum, "JSON invalido.");
+    return;
+  }
+
+  const char* msgType = doc["type"] | "";
+
+  if (strcmp(msgType, "get") == 0) {
+    sendWebState(clientNum);
+    return;
+  }
+
+  if (strcmp(msgType, "save") == 0) {
+    applyConfigFromJson(doc["config"].as<JsonObjectConst>());
+    saveConfig();
+    selectHomeAssistantHost();
+    selectedMqttHost = resolvedMqttHost();
+    mqttClient.setServer(selectedMqttHost.c_str(), cfg.mqttPort);
+    setupPresenceLed();
+    setPresenceLed(presence);
+    broadcastWebState("Guardado.");
+    return;
+  }
+
+  if (strcmp(msgType, "ledTest") == 0) {
+    if (doc["config"].is<JsonObjectConst>()) {
+      JsonObjectConst formConfig = doc["config"].as<JsonObjectConst>();
+      cfg.ledActiveLow = formConfig["ledActiveLow"] | cfg.ledActiveLow;
+      cfg.ledUsePwm = formConfig["ledUsePwm"] | cfg.ledUsePwm;
+      cfg.ledPresenceDuty = constrain((int)(formConfig["ledPresenceDuty"] | cfg.ledPresenceDuty), 0, 255);
+      setupPresenceLed();
+      Serial.printf("[LED] test activeLow=%s usePwm=%s duty=%u pwmOn=%u pwmOff=%u\n",
+                    cfg.ledActiveLow ? "true" : "false",
+                    cfg.ledUsePwm ? "true" : "false",
+                    cfg.ledPresenceDuty,
+                    ledPwmValue(true),
+                    ledPwmValue(false));
+    }
+    ledTestUntilMs = millis() + 5000;
+    ledTestNextToggleMs = 0;
+    ledTestState = false;
+    tickLedTest();
+    broadcastWebState("Probando LED 5s.");
+    return;
+  }
+
+  if (strcmp(msgType, "ledPreview") == 0) {
+    if (doc["config"].is<JsonObjectConst>()) {
+      JsonObjectConst formConfig = doc["config"].as<JsonObjectConst>();
+      cfg.ledActiveLow = formConfig["ledActiveLow"] | cfg.ledActiveLow;
+      cfg.ledUsePwm = formConfig["ledUsePwm"] | cfg.ledUsePwm;
+      cfg.ledPresenceDuty = constrain((int)(formConfig["ledPresenceDuty"] | cfg.ledPresenceDuty), 0, 255);
+      setupPresenceLed();
+      ledPreviewUntilMs = millis() + 1500;
+      setPresenceLed(true);
+      sendWebState(clientNum, "Preview LED.");
+    }
+    return;
+  }
+
+  sendWebState(clientNum, "Comando desconocido.");
+}
+
+void applyConfigFromJson(JsonObjectConst doc) {
+  cfg.deviceId = doc["deviceId"] | cfg.deviceId;
+  cfg.uniqueBase = doc["uniqueBase"] | cfg.uniqueBase;
+  cfg.deviceName = doc["deviceName"] | cfg.deviceName;
+  cfg.wifiSsid = doc["wifiSsid"] | cfg.wifiSsid;
+  cfg.wifiPass = doc["wifiPass"] | cfg.wifiPass;
+  cfg.haHost = doc["haHost"] | cfg.haHost;
+  cfg.mqttHost = doc["mqttHost"] | cfg.mqttHost;
+  cfg.mqttPort = constrain((int)(doc["mqttPort"] | cfg.mqttPort), 1, 65535);
+  cfg.mqttUser = doc["mqttUser"] | cfg.mqttUser;
+  cfg.mqttPass = doc["mqttPass"] | cfg.mqttPass;
+  cfg.usbUartMode = doc["usbUartMode"] | cfg.usbUartMode;
+  cfg.ledActiveLow = doc["ledActiveLow"] | cfg.ledActiveLow;
+  cfg.ledUsePwm = doc["ledUsePwm"] | cfg.ledUsePwm;
+  cfg.ledPresenceDuty = constrain((int)(doc["ledPresenceDuty"] | cfg.ledPresenceDuty), 0, 255);
+}
+
+void sendWebState(uint8_t clientNum, const char* message) {
+  JsonDocument doc;
+  JsonObject config = doc["config"].to<JsonObject>();
+  config["deviceId"] = cfg.deviceId;
+  config["uniqueBase"] = cfg.uniqueBase;
+  config["deviceName"] = cfg.deviceName;
+  config["wifiSsid"] = cfg.wifiSsid;
+  config["wifiPass"] = cfg.wifiPass;
+  config["haHost"] = cfg.haHost;
+  config["mqttHost"] = cfg.mqttHost;
+  config["mqttPort"] = cfg.mqttPort;
+  config["mqttUser"] = cfg.mqttUser;
+  config["mqttPass"] = cfg.mqttPass;
+  config["usbUartMode"] = cfg.usbUartMode;
+  config["ledActiveLow"] = cfg.ledActiveLow;
+  config["ledUsePwm"] = cfg.ledUsePwm;
+  config["ledPresenceDuty"] = cfg.ledPresenceDuty;
+  doc["rawPresence"] = rawPresence;
+  doc["presence"] = presence;
+  doc["distance"] = targetDistance;
+  doc["selectedHaHost"] = selectedHaHost;
+  doc["selectedMqttHost"] = selectedMqttHost;
+  doc["mqttConnected"] = mqttClient.connected();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["ledPwmValue"] = ledPwmValue(ledTestUntilMs > millis() || presence);
+  doc["message"] = message ? message : "";
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.sendTXT(clientNum, payload);
+}
+
+void broadcastWebState(const char* message) {
+  JsonDocument doc;
+  JsonObject config = doc["config"].to<JsonObject>();
+  config["deviceId"] = cfg.deviceId;
+  config["uniqueBase"] = cfg.uniqueBase;
+  config["deviceName"] = cfg.deviceName;
+  config["wifiSsid"] = cfg.wifiSsid;
+  config["wifiPass"] = cfg.wifiPass;
+  config["haHost"] = cfg.haHost;
+  config["mqttHost"] = cfg.mqttHost;
+  config["mqttPort"] = cfg.mqttPort;
+  config["mqttUser"] = cfg.mqttUser;
+  config["mqttPass"] = cfg.mqttPass;
+  config["usbUartMode"] = cfg.usbUartMode;
+  config["ledActiveLow"] = cfg.ledActiveLow;
+  config["ledUsePwm"] = cfg.ledUsePwm;
+  config["ledPresenceDuty"] = cfg.ledPresenceDuty;
+  doc["rawPresence"] = rawPresence;
+  doc["presence"] = presence;
+  doc["distance"] = targetDistance;
+  doc["selectedHaHost"] = selectedHaHost;
+  doc["selectedMqttHost"] = selectedMqttHost;
+  doc["mqttConnected"] = mqttClient.connected();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["ledPwmValue"] = ledPwmValue(ledTestUntilMs > millis() || presence);
+  doc["message"] = message ? message : "";
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.broadcastTXT(payload);
 }
 
 // =====================================================
@@ -575,7 +715,6 @@ void setup() {
   delay(1000);
 
   loadConfig();
-  setPresenceLed(false);
 
 #if NODE_MODE == NODE_MODE_LIGHT_SLEEP
   pinMode(SENSOR_OUT_PIN, INPUT);
@@ -584,6 +723,7 @@ void setup() {
   Serial.println();
   Serial.println("=== mmWave MQTT node v3 ===");
   Serial.printf("Device: %s | unique: %s\n", cfg.deviceId.c_str(), cfg.uniqueBase.c_str());
+  WiFi.onEvent(handleWiFiEvent);
 
 #if NODE_MODE == NODE_MODE_ALWAYS_ON
   Serial.println("Mode: ALWAYS_ON (usa UART para presencia)");
@@ -595,11 +735,19 @@ void setup() {
   delay(100);
 
   connectWiFi();
-  selectHomeAssistantHost();
-  selectedMqttHost = resolvedMqttHost();
-  mqttClient.setServer(selectedMqttHost.c_str(), cfg.mqttPort);
-  mqttClient.setBufferSize(1024);
+  setupPresenceLed();
+  setPresenceLed(false);
   startWebApp();
+
+  if (isWifiConnected()) {
+    selectHomeAssistantHost();
+    selectedMqttHost = resolvedMqttHost();
+    mqttClient.setServer(selectedMqttHost.c_str(), cfg.mqttPort);
+    mqttClient.setBufferSize(1024);
+  } else {
+    selectedMqttHost = resolvedMqttHost();
+    mqttClient.setBufferSize(1024);
+  }
 
   if (!cfg.usbUartMode) {
     sendHexData(REPORT_MODE_CMD);
@@ -625,7 +773,7 @@ void setup() {
     lastRawOffMs = now;
   }
 
-  if (!cfg.usbUartMode) {
+  if (!cfg.usbUartMode && isWifiConnected()) {
     connectMQTT();
     publishState(true);
     publishDebug("boot");
@@ -641,6 +789,10 @@ void setup() {
 // =====================================================
 void loop() {
   webServer.handleClient();
+  webSocket.loop();
+  tickLedTest();
+  tickLedPreview();
+  tickPresenceLed();
 
   if (cfg.usbUartMode) {
     processUsbUartBridge();
@@ -680,16 +832,33 @@ void loop() {
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
-  Serial.print("Connecting WiFi");
-  WiFi.mode(WIFI_STA);
+  Serial.printf("Connecting WiFi SSID='%s' passLen=%u",
+                cfg.wifiSsid.c_str(), (unsigned)cfg.wifiPass.length());
+  WiFi.mode(configApStarted ? WIFI_AP_STA : WIFI_STA);
+  WiFi.persistent(false);
   WiFi.setSleep(false);
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(false, false);
   delay(500);
-  WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+
+  uint8_t bssid[6] = {0};
+  int32_t channel = 0;
+  int32_t rssi = -127;
+  wifi_auth_mode_t authMode = WIFI_AUTH_OPEN;
+  if (findBestConfiguredWifi(bssid, channel, rssi, authMode)) {
+    Serial.printf(" channel=%ld rssi=%ld auth=%d", (long)channel, (long)rssi, (int)authMode);
+    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str(), channel, bssid, true);
+  } else {
+    Serial.print(" no-scan-match");
+    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+  }
+  lastWifiRetryMs = millis();
 
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 200) {
-    webServer.handleClient();
+  while (WiFi.status() != WL_CONNECTED && retries < (int)(WIFI_CONNECT_TIMEOUT_MS / 250)) {
+    if (webAppStarted) {
+      webServer.handleClient();
+      webSocket.loop();
+    }
     delay(250);
     Serial.print('.');
     retries++;
@@ -699,13 +868,101 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi OK, IP: ");
     Serial.println(WiFi.localIP());
+    configApStarted = false;
   } else {
     Serial.print("WiFi FAILED, status=");
     Serial.println(WiFi.status());
+    printWifiScanForConfiguredSsid();
+    startConfigAccessPoint();
+  }
+}
+
+bool isWifiConnected() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void printWifiScanForConfiguredSsid() {
+  Serial.println("[WiFi] scan...");
+  int found = WiFi.scanNetworks(false, true);
+  if (found < 0) {
+    Serial.printf("[WiFi] scan fallo=%d\n", found);
+    return;
+  }
+
+  bool matched = false;
+  for (int i = 0; i < found; i++) {
+    if (WiFi.SSID(i) != cfg.wifiSsid) continue;
+    matched = true;
+    Serial.printf("[WiFi] SSID encontrado RSSI=%d canal=%d auth=%d bssid=%s\n",
+                  WiFi.RSSI(i), WiFi.channel(i), WiFi.encryptionType(i), WiFi.BSSIDstr(i).c_str());
+  }
+
+  if (!matched) {
+    Serial.printf("[WiFi] SSID '%s' no aparece en scan (%d redes)\n", cfg.wifiSsid.c_str(), found);
+  }
+  WiFi.scanDelete();
+}
+
+bool findBestConfiguredWifi(uint8_t* bssid, int32_t& channel, int32_t& rssi, wifi_auth_mode_t& authMode) {
+  int found = WiFi.scanNetworks(false, true);
+  if (found <= 0) return false;
+
+  int best = -1;
+  int32_t bestRssi = -128;
+  for (int i = 0; i < found; i++) {
+    if (WiFi.SSID(i) != cfg.wifiSsid) continue;
+    if (WiFi.RSSI(i) <= bestRssi) continue;
+    best = i;
+    bestRssi = WiFi.RSSI(i);
+  }
+
+  if (best < 0) {
+    WiFi.scanDelete();
+    return false;
+  }
+
+  const uint8_t* foundBssid = WiFi.BSSID(best);
+  memcpy(bssid, foundBssid, 6);
+  channel = WiFi.channel(best);
+  rssi = WiFi.RSSI(best);
+  authMode = WiFi.encryptionType(best);
+  WiFi.scanDelete();
+  return true;
+}
+
+void startConfigAccessPoint() {
+  if (configApStarted) return;
+
+  String apName = cfg.uniqueBase;
+  apName.replace("_", "-");
+  apName += "-setup";
+
+  WiFi.mode(WIFI_AP_STA);
+  bool ok = WiFi.softAP(apName.c_str(), "mmwave1234");
+  configApStarted = ok;
+  Serial.printf("[WiFi] AP config %s SSID='%s' pass='mmwave1234' IP=%s\n",
+                ok ? "OK" : "FAIL", apName.c_str(), WiFi.softAPIP().toString().c_str());
+}
+
+void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("[WiFi] STA connected");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("[WiFi] got IP ");
+      Serial.println(WiFi.localIP());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("[WiFi] STA disconnected reason=%u\n", info.wifi_sta_disconnected.reason);
+      break;
+    default:
+      break;
   }
 }
 
 void connectMQTT() {
+  if (!isWifiConnected()) return;
   if (mqttClient.connected()) return;
   if (millis() - lastMqttAttemptMs < 2000) return;
   lastMqttAttemptMs = millis();
@@ -741,7 +998,9 @@ void connectMQTT() {
 
 void ensureConnections() {
   if (WiFi.status() != WL_CONNECTED) {
+    if (configApStarted && (millis() - lastWifiRetryMs) < WIFI_AP_RETRY_MS) return;
     connectWiFi();
+    if (!isWifiConnected()) return;
     selectHomeAssistantHost();
     selectedMqttHost = resolvedMqttHost();
     mqttClient.setServer(selectedMqttHost.c_str(), cfg.mqttPort);
@@ -888,10 +1147,104 @@ void setRawPresence(bool newValue, const char* reason) {
   publishState(true);
 }
 
-void setPresenceLed(bool on) {
+void setupPresenceLed() {
+  bool settingsChanged = !presenceLedReady ||
+                         lastLedUsePwm != cfg.ledUsePwm ||
+                         lastLedActiveLow != cfg.ledActiveLow ||
+                         lastLedPresenceDuty != cfg.ledPresenceDuty;
+
+  if (!settingsChanged) return;
+
+  Serial.printf("[LED] pin=%d activeLow=%s usePwm=%s duty=%u\n",
+                PRESENCE_LED_PIN,
+                cfg.ledActiveLow ? "true" : "false",
+                cfg.ledUsePwm ? "true" : "false",
+                cfg.ledPresenceDuty);
+
+  if (presenceLedPwmAttached) {
+    ledcDetachPin(PRESENCE_LED_PIN);
+    presenceLedPwmAttached = false;
+  }
+
+  pinMode(PRESENCE_LED_PIN, OUTPUT);
+
+  if (cfg.ledUsePwm) {
+    ledcSetup(LED_PWM_CHANNEL, LED_PWM_FREQ, LED_PWM_RESOLUTION);
+    ledcAttachPin(PRESENCE_LED_PIN, LED_PWM_CHANNEL);
+    presenceLedPwmAttached = true;
+  }
+
+  presenceLedReady = true;
+  lastLedUsePwm = cfg.ledUsePwm;
+  lastLedActiveLow = cfg.ledActiveLow;
+  lastLedPresenceDuty = cfg.ledPresenceDuty;
+  setPresenceLed(ledTargetOn);
+}
+
+uint8_t ledPwmValue(bool on) {
   uint8_t activeDuty = on ? cfg.ledPresenceDuty : 0;
-  uint8_t pwmValue = cfg.ledActiveLow ? (255 - activeDuty) : activeDuty;
-  analogWrite(BUILTIN_LED, pwmValue);
+  return cfg.ledActiveLow ? (255 - activeDuty) : activeDuty;
+}
+
+void setPresenceLed(bool on) {
+  ledTargetOn = on;
+  if (!presenceLedReady) return;
+
+  if (cfg.ledUsePwm) {
+    ledcWrite(LED_PWM_CHANNEL, ledPwmValue(on));
+  } else {
+    tickPresenceLed();
+  }
+}
+
+void writePresenceLedDigital(bool on) {
+  bool levelHigh = cfg.ledActiveLow ? !on : on;
+  digitalWrite(PRESENCE_LED_PIN, levelHigh ? HIGH : LOW);
+}
+
+void tickPresenceLed() {
+  if (!presenceLedReady || cfg.ledUsePwm) return;
+
+  if (!ledTargetOn || cfg.ledPresenceDuty == 0) {
+    writePresenceLedDigital(false);
+    return;
+  }
+
+  if (cfg.ledPresenceDuty >= 255) {
+    writePresenceLedDigital(true);
+    return;
+  }
+
+  static const uint32_t SOFT_PWM_PERIOD_MS = 1000;
+  uint32_t phase = millis() % SOFT_PWM_PERIOD_MS;
+  uint32_t onMs = ((uint32_t)cfg.ledPresenceDuty * SOFT_PWM_PERIOD_MS) / 255;
+  writePresenceLedDigital(phase < onMs);
+}
+
+void tickLedTest() {
+  if (ledTestUntilMs == 0) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - ledTestUntilMs) < 0) {
+    if (ledTestNextToggleMs == 0 || (int32_t)(now - ledTestNextToggleMs) >= 0) {
+      ledTestState = !ledTestState;
+      setPresenceLed(ledTestState);
+      ledTestNextToggleMs = now + 350;
+    }
+    return;
+  }
+
+  ledTestUntilMs = 0;
+  ledTestNextToggleMs = 0;
+  setPresenceLed(presence);
+  broadcastWebState("Prueba LED terminada.");
+}
+
+void tickLedPreview() {
+  if (ledPreviewUntilMs == 0 || ledTestUntilMs != 0) return;
+  if ((int32_t)(millis() - ledPreviewUntilMs) < 0) return;
+
+  ledPreviewUntilMs = 0;
+  setPresenceLed(presence);
 }
 
 void updatePresenceLogic() {
@@ -918,18 +1271,26 @@ void updatePresenceLogic() {
 void publishState(bool force) {
   if (!mqttClient.connected()) return;
 
+  bool anyChange = false;
+
   if (force || rawPresence != lastPublishedRaw) {
     mqttPublishRetained(topicPresenceRaw(), rawPresence ? "ON" : "OFF");
     lastPublishedRaw = rawPresence;
+    anyChange = true;
   }
 
   if (force || presence != lastPublishedPresence) {
     mqttPublishRetained(topicPresence(), presence ? "ON" : "OFF");
     lastPublishedPresence = presence;
+    anyChange = true;
   }
 
   if (force) {
     mqttPublishRetained(topicDistance(), String(targetDistance));
+  }
+
+  if (anyChange) {
+    broadcastWebState();
   }
 }
 

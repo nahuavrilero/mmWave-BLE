@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>mmWave config</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,sans-serif;margin:0;background:#f5f7f8;color:#15202b}
+    main{max-width:760px;margin:0 auto;padding:20px}
+    h1{font-size:28px;margin:0 0 6px}
+    h2{font-size:18px;margin:0 0 12px}
+    .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+    label{display:grid;gap:5px;font-size:13px}
+    input{font:inherit;padding:9px;border:1px solid #b8c3cc;border-radius:6px;background:white}
+    input[type=checkbox]{width:20px;height:20px}
+    section{margin:14px 0;padding:14px 0;border-top:1px solid #d7dee4}
+    button{font:inherit;padding:10px 14px;border:0;border-radius:6px;background:#1f7a5c;color:white;cursor:pointer}
+    button.secondary{background:#49616f}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .muted{color:#5a6872;font-size:13px}
+    .check{display:flex;gap:10px;align-items:center}
+    .check span{font-size:14px}
+    .pill{display:inline-block;border:1px solid #c9d2d9;border-radius:999px;padding:4px 9px;background:white}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>mmWave config</h1>
+    <p class="muted">
+      <span class="pill" id="ws">WS: conectando</span>
+      <span class="pill" id="presence">presencia: -</span>
+      <span class="pill" id="hosts">hosts: -</span>
+    </p>
+
+    <form id="form">
+      <section>
+        <h2>Identidad</h2>
+        <div class="grid">
+          <label>Device ID<input name="deviceId"></label>
+          <label>Unique base<input name="uniqueBase"></label>
+          <label>Nombre<input name="deviceName"></label>
+        </div>
+      </section>
+
+      <section>
+        <h2>Red</h2>
+        <div class="grid">
+          <label>WiFi SSID<input name="wifiSsid"></label>
+          <label>WiFi pass<input name="wifiPass" type="password"></label>
+          <label>HA host<input name="haHost" placeholder="auto"></label>
+          <label>MQTT host<input name="mqttHost" placeholder="usa HA detectado"></label>
+          <label>MQTT port<input name="mqttPort" type="number" min="1" max="65535"></label>
+          <label>MQTT user<input name="mqttUser"></label>
+          <label>MQTT pass<input name="mqttPass" type="password"></label>
+        </div>
+      </section>
+
+      <section>
+        <h2>Modos</h2>
+        <div class="grid">
+          <label class="check"><input type="checkbox" name="usbUartMode"><span>USB &gt; UART</span></label>
+          <label class="check"><input type="checkbox" name="ledActiveLow"><span>LED onboard activo en LOW</span></label>
+          <label class="check"><input type="checkbox" name="ledUsePwm"><span>Usar PWM LED</span></label>
+          <label>Brillo LED presencia<input name="ledPresenceDuty" type="number" min="0" max="255"></label>
+        </div>
+      </section>
+
+      <div class="row">
+        <button type="submit">Guardar</button>
+        <button class="secondary" type="button" id="ledTest">Probar LED</button>
+        <span class="muted" id="msg">Listo.</span>
+      </div>
+    </form>
+  </main>
+
+  <script>
+    const form = document.querySelector("#form");
+    const msg = document.querySelector("#msg");
+    const wsBadge = document.querySelector("#ws");
+    const presenceBadge = document.querySelector("#presence");
+    const hostsBadge = document.querySelector("#hosts");
+    let ws;
+
+    function setForm(config) {
+      for (const [key, value] of Object.entries(config)) {
+        const el = form.elements[key];
+        if (!el) continue;
+        if (el.type === "checkbox") el.checked = Boolean(value);
+        else el.value = value ?? "";
+      }
+    }
+
+    function getForm() {
+      return {
+        deviceId: form.elements.deviceId.value,
+        uniqueBase: form.elements.uniqueBase.value,
+        deviceName: form.elements.deviceName.value,
+        wifiSsid: form.elements.wifiSsid.value,
+        wifiPass: form.elements.wifiPass.value,
+        haHost: form.elements.haHost.value,
+        mqttHost: form.elements.mqttHost.value,
+        mqttPort: Number(form.elements.mqttPort.value || 1883),
+        mqttUser: form.elements.mqttUser.value,
+        mqttPass: form.elements.mqttPass.value,
+        usbUartMode: form.elements.usbUartMode.checked,
+        ledActiveLow: form.elements.ledActiveLow.checked,
+        ledUsePwm: form.elements.ledUsePwm.checked,
+        ledPresenceDuty: Number(form.elements.ledPresenceDuty.value || 0)
+      };
+    }
+
+    function setStatus(data) {
+      if (data.config) setForm(data.config);
+      presenceBadge.textContent = `presencia: ${data.presence ? "ON" : "OFF"} / raw ${data.rawPresence ? "ON" : "OFF"}`;
+      hostsBadge.textContent = `HA: ${data.selectedHaHost || "-"} | MQTT: ${data.selectedMqttHost || "-"}`;
+      msg.textContent = data.message || "Listo.";
+    }
+
+    function connect() {
+      ws = new WebSocket(`ws://${location.hostname}:81/`);
+      ws.onopen = () => {
+        wsBadge.textContent = "WS: conectado";
+        ws.send(JSON.stringify({type:"get"}));
+      };
+      ws.onclose = () => {
+        wsBadge.textContent = "WS: desconectado";
+        setTimeout(connect, 1500);
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (event) => setStatus(JSON.parse(event.data));
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      msg.textContent = "Guardando...";
+      ws.send(JSON.stringify({type:"save", config:getForm()}));
+    });
+
+    document.querySelector("#ledTest").addEventListener("click", () => {
+      ws.send(JSON.stringify({type:"ledTest", config:getForm()}));
+    });
+
+    for (const name of ["ledPresenceDuty", "ledActiveLow", "ledUsePwm"]) {
+      form.elements[name].addEventListener("input", () => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({type:"ledPreview", config:getForm()}));
+        }
+      });
+    }
+
+    connect();
+  </script>
+</body>
+</html>
